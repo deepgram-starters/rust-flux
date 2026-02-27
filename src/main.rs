@@ -420,7 +420,7 @@ async fn proxy_flux(
                         text.len()
                     );
                     if dg_sender
-                        .send(tungstenite::Message::Text(text.into()))
+                        .send(tungstenite::Message::Text(text.to_string().into()))
                         .await
                         .is_err()
                     {
@@ -500,7 +500,7 @@ async fn proxy_flux(
                         text.len()
                     );
                     if client_sender
-                        .send(Message::Text(text.into()))
+                        .send(Message::Text(text.to_string().into()))
                         .await
                         .is_err()
                     {
