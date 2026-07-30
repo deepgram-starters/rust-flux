@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 axum = { version = "0.8", features = ["ws"] }
+deepgram = { version = "0.10.0", default-features = false, features = ["listen"] }
 dotenvy = "0.15"
 futures-util = "0.3"
 hex = "0.4"
@@ -14,7 +15,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_urlencoded = "0.7"
 tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
 toml = "0.8"
 tower-http = { version = "0.6", features = ["cors"] }
 url = "2"
