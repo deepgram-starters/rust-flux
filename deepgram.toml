@@ -6,7 +6,7 @@ repository = "https://github.com/deepgram-starters/rust-flux"
 useCase = "flux"
 language = "rust"
 framework = "axum"
-sdk = "N/A"
+sdk = "deepgram"
 tags = ["flux", "turn-detection", "real-time-transcription", "streaming-stt", "end-of-turn", "rust", "axum"]
 
 [check]

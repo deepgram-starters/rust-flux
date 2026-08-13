@@ -21,12 +21,18 @@ use axum::{
     Router,
 };
 use axum::extract::ws::{Message, WebSocket};
+use deepgram::{
+    common::{
+        flux_response::FluxResponse,
+        options::{Encoding, Model, Options},
+    },
+    Deepgram,
+};
 use futures_util::{SinkExt, StreamExt};
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 use std::{env, sync::Arc, time::SystemTime};
 use tokio::net::TcpListener;
-use tokio_tungstenite::{connect_async, tungstenite};
 use tower_http::cors::CorsLayer;
 
 // ============================================================================
@@ -37,7 +43,6 @@ use tower_http::cors::CorsLayer;
 #[derive(Clone)]
 struct Config {
     deepgram_api_key: String,
-    deepgram_stt_url: String,
     port: u16,
     host: String,
     session_secret: String,
@@ -69,7 +74,6 @@ fn load_config() -> Config {
 
     Config {
         deepgram_api_key: api_key,
-        deepgram_stt_url: "wss://api.deepgram.com/v2/listen".to_string(),
         port,
         host,
         session_secret,
@@ -294,6 +298,17 @@ async fn handle_flux(
 }
 
 /// Proxies WebSocket messages bidirectionally between the client and Deepgram's Flux API.
+///
+/// The Deepgram side is driven by the official `deepgram` crate's Flux
+/// [`FluxHandle`](deepgram::listen::flux). Audio frames from the browser are
+/// forwarded via `send_data`, a `CloseStream` control message maps onto
+/// `close_stream`, and typed [`FluxResponse`] events coming back from Deepgram
+/// are re-serialized to JSON (preserving the `type`-tagged wire shape) and
+/// forwarded to the browser unchanged.
+///
+/// NOTE: Deepgram's Flux module interface in the SDK is currently marked as
+/// "changing", so the exact builder/handle surface used here may shift in a
+/// future release.
 async fn proxy_flux(
     client_ws: WebSocket,
     config: Arc<Config>,
@@ -307,255 +322,188 @@ async fn proxy_flux(
 ) {
     println!("Client connected to /api/flux");
 
-    // Build Deepgram WebSocket URL with query parameters
-    let mut deepgram_url =
-        url::Url::parse(&config.deepgram_stt_url).expect("Invalid Deepgram URL");
-
-    deepgram_url
-        .query_pairs_mut()
-        .append_pair("model", &model)
-        .append_pair("encoding", &encoding)
-        .append_pair("sample_rate", &sample_rate);
-
-    if let Some(ref eot) = eot_threshold {
-        deepgram_url
-            .query_pairs_mut()
-            .append_pair("eot_threshold", eot);
-    }
-    if let Some(ref eager_eot) = eager_eot_threshold {
-        deepgram_url
-            .query_pairs_mut()
-            .append_pair("eager_eot_threshold", eager_eot);
-    }
-    if let Some(ref timeout) = eot_timeout_ms {
-        deepgram_url
-            .query_pairs_mut()
-            .append_pair("eot_timeout_ms", timeout);
-    }
-    for term in &keyterms {
-        deepgram_url
-            .query_pairs_mut()
-            .append_pair("keyterm", term);
-    }
-
     println!(
         "Connecting to Deepgram Flux: model={}, encoding={}, sample_rate={}",
         model, encoding, sample_rate
     );
-    println!("Deepgram URL: {}", deepgram_url);
 
-    // Create WebSocket connection to Deepgram with auth header
-    let request = tungstenite::http::Request::builder()
-        .uri(deepgram_url.as_str())
-        .header("Authorization", format!("Token {}", config.deepgram_api_key))
-        .header("Host", deepgram_url.host_str().unwrap_or("api.deepgram.com"))
-        .header("Connection", "Upgrade")
-        .header("Upgrade", "websocket")
-        .header("Sec-WebSocket-Version", "13")
-        .header(
-            "Sec-WebSocket-Key",
-            tungstenite::handshake::client::generate_key(),
-        )
-        .body(())
-        .expect("Failed to build Deepgram request");
+    // Build Flux options from the forwarded query parameters.
+    let mut builder = Options::builder().model(Model::from(model));
+    if let Some(v) = eot_threshold.as_deref().and_then(|s| s.parse::<f64>().ok()) {
+        builder = builder.eot_threshold(v);
+    }
+    if let Some(v) = eager_eot_threshold
+        .as_deref()
+        .and_then(|s| s.parse::<f64>().ok())
+    {
+        builder = builder.eager_eot_threshold(v);
+    }
+    if let Some(v) = eot_timeout_ms.as_deref().and_then(|s| s.parse::<u32>().ok()) {
+        builder = builder.eot_timeout_ms(v);
+    }
+    if !keyterms.is_empty() {
+        builder = builder.keyterms(keyterms.iter().map(|s| s.as_str()));
+    }
+    let options = builder.build();
 
-    let (deepgram_ws, _) = match connect_async(request).await {
-        Ok(conn) => conn,
+    let sample_rate_num: u32 = sample_rate.parse().unwrap_or(16000);
+
+    // Establish the Deepgram Flux websocket via the SDK.
+    let dg = match Deepgram::new(&config.deepgram_api_key) {
+        Ok(dg) => dg,
+        Err(e) => {
+            eprintln!("Failed to initialize Deepgram client: {}", e);
+            close_client(client_ws, 1011, "Deepgram connection failed").await;
+            return;
+        }
+    };
+
+    let mut dg_handle = match dg
+        .transcription()
+        .flux_request_with_options(options)
+        .encoding(map_encoding(&encoding))
+        .sample_rate(sample_rate_num)
+        .handle()
+        .await
+    {
+        Ok(handle) => handle,
         Err(e) => {
             eprintln!("Deepgram connection failed: {}", e);
-            let (mut sender, _) = client_ws.split();
-            let _ = sender
-                .send(Message::Close(Some(axum::extract::ws::CloseFrame {
-                    code: 1011,
-                    reason: "Deepgram connection failed".into(),
-                })))
-                .await;
+            close_client(client_ws, 1011, "Deepgram connection failed").await;
             return;
         }
     };
 
     println!("Connected to Deepgram Flux API");
 
-    // Split both WebSocket connections for bidirectional forwarding
     let (mut client_sender, mut client_receiver) = client_ws.split();
-    let (mut dg_sender, mut dg_receiver) = deepgram_ws.split();
+    let mut client_msg_count: u64 = 0;
+    let mut dg_msg_count: u64 = 0;
 
-    let client_msg_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let dg_msg_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
-
-    let client_msg_count_clone = client_msg_count.clone();
-    let dg_msg_count_clone = dg_msg_count.clone();
-
-    // Forward client messages to Deepgram
-    let client_to_dg = tokio::spawn(async move {
-        while let Some(msg) = client_receiver.next().await {
-            match msg {
-                Ok(Message::Binary(data)) => {
-                    let count = client_msg_count_clone
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                        + 1;
-                    if count % 100 == 0 {
+    // Single-task proxy loop: the SDK handle is not splittable, so both
+    // directions share one task via `tokio::select!`.
+    loop {
+        tokio::select! {
+            client_msg = client_receiver.next() => {
+                match client_msg {
+                    Some(Ok(Message::Binary(data))) => {
+                        client_msg_count += 1;
+                        if client_msg_count % 100 == 0 {
+                            println!(
+                                "-> Client message #{} (binary: true, size: {})",
+                                client_msg_count,
+                                data.len()
+                            );
+                        }
+                        if dg_handle.send_data(data.to_vec()).await.is_err() {
+                            eprintln!("Error forwarding to Deepgram");
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Text(text))) => {
+                        client_msg_count += 1;
                         println!(
-                            "-> Client message #{} (binary: true, size: {})",
-                            count,
-                            data.len()
+                            "-> Client message #{} (binary: false, size: {})",
+                            client_msg_count,
+                            text.len()
                         );
+                        // The only client->Deepgram control message the Flux
+                        // frontend sends is CloseStream; map it onto the handle.
+                        let text = text.to_string();
+                        let kind = serde_json::from_str::<serde_json::Value>(&text)
+                            .ok()
+                            .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(String::from));
+                        if matches!(kind.as_deref(), Some("CloseStream")) {
+                            let _ = dg_handle.close_stream().await;
+                            break;
+                        }
                     }
-                    if dg_sender
-                        .send(tungstenite::Message::Binary(data.into()))
-                        .await
-                        .is_err()
-                    {
-                        eprintln!("Error forwarding to Deepgram");
+                    Some(Ok(Message::Close(_))) | None => {
+                        println!("Client disconnected normally");
                         break;
                     }
-                }
-                Ok(Message::Text(text)) => {
-                    let count = client_msg_count_clone
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                        + 1;
-                    println!(
-                        "-> Client message #{} (binary: false, size: {})",
-                        count,
-                        text.len()
-                    );
-                    if dg_sender
-                        .send(tungstenite::Message::Text(text.to_string().into()))
-                        .await
-                        .is_err()
-                    {
-                        eprintln!("Error forwarding to Deepgram");
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => {
+                        eprintln!("Client read error: {}", e);
                         break;
                     }
-                }
-                Ok(Message::Close(_)) => {
-                    println!("Client disconnected normally");
-                    let _ = dg_sender
-                        .send(tungstenite::Message::Close(Some(
-                            tungstenite::protocol::CloseFrame {
-                                code: tungstenite::protocol::frame::coding::CloseCode::Normal,
-                                reason: "Client disconnected".into(),
-                            },
-                        )))
-                        .await;
-                    break;
-                }
-                Ok(Message::Ping(data)) => {
-                    let _ = dg_sender
-                        .send(tungstenite::Message::Ping(data.into()))
-                        .await;
-                }
-                Ok(Message::Pong(data)) => {
-                    let _ = dg_sender
-                        .send(tungstenite::Message::Pong(data.into()))
-                        .await;
-                }
-                Err(e) => {
-                    eprintln!("Client read error: {}", e);
-                    let _ = dg_sender
-                        .send(tungstenite::Message::Close(Some(
-                            tungstenite::protocol::CloseFrame {
-                                code: tungstenite::protocol::frame::coding::CloseCode::Normal,
-                                reason: "Client disconnected".into(),
-                            },
-                        )))
-                        .await;
-                    break;
                 }
             }
-        }
-    });
-
-    // Forward Deepgram messages to client
-    let dg_to_client = tokio::spawn(async move {
-        while let Some(msg) = dg_receiver.next().await {
-            match msg {
-                Ok(tungstenite::Message::Binary(data)) => {
-                    let count = dg_msg_count_clone
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                        + 1;
-                    if count % 10 == 0 {
-                        println!(
-                            "<- Deepgram message #{} (binary: true, size: {})",
-                            count,
-                            data.len()
-                        );
-                    }
-                    if client_sender
-                        .send(Message::Binary(data.into()))
-                        .await
-                        .is_err()
-                    {
-                        eprintln!("Error forwarding to client");
-                        break;
-                    }
-                }
-                Ok(tungstenite::Message::Text(text)) => {
-                    let count = dg_msg_count_clone
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                        + 1;
-                    println!(
-                        "<- Deepgram message #{} (binary: false, size: {})",
-                        count,
-                        text.len()
-                    );
-                    if client_sender
-                        .send(Message::Text(text.to_string().into()))
-                        .await
-                        .is_err()
-                    {
-                        eprintln!("Error forwarding to client");
-                        break;
-                    }
-                }
-                Ok(tungstenite::Message::Close(frame)) => {
-                    println!(
-                        "Deepgram connection closed: {}",
-                        frame
-                            .as_ref()
-                            .map(|f| f.reason.to_string())
-                            .unwrap_or_default()
-                    );
-                    let _ = client_sender
-                        .send(Message::Close(frame.map(|f| {
-                            axum::extract::ws::CloseFrame {
-                                code: f.code.into(),
-                                reason: f.reason.to_string().into(),
+            dg_msg = dg_handle.receive() => {
+                match dg_msg {
+                    Some(Ok(response)) => {
+                        dg_msg_count += 1;
+                        match serde_json::to_string(&response) {
+                            Ok(json) => {
+                                if dg_msg_count % 10 == 0 {
+                                    println!(
+                                        "<- Deepgram message #{} (size: {})",
+                                        dg_msg_count,
+                                        json.len()
+                                    );
+                                }
+                                if client_sender.send(Message::Text(json.into())).await.is_err() {
+                                    eprintln!("Error forwarding to client");
+                                    break;
+                                }
                             }
-                        })))
-                        .await;
-                    break;
-                }
-                Ok(tungstenite::Message::Ping(data)) => {
-                    let _ = client_sender.send(Message::Ping(data.into())).await;
-                }
-                Ok(tungstenite::Message::Pong(data)) => {
-                    let _ = client_sender.send(Message::Pong(data.into())).await;
-                }
-                Ok(tungstenite::Message::Frame(_)) => {
-                    // Raw frames are not forwarded
-                }
-                Err(e) => {
-                    eprintln!("Deepgram read error: {}", e);
-                    let _ = client_sender
-                        .send(Message::Close(Some(axum::extract::ws::CloseFrame {
-                            code: 1000,
-                            reason: "Deepgram disconnected".into(),
-                        })))
-                        .await;
-                    break;
+                            Err(e) => eprintln!("Error serializing Deepgram response: {}", e),
+                        }
+                        // Stop forwarding once the server reports a fatal error.
+                        if matches!(response, FluxResponse::FatalError { .. }) {
+                            break;
+                        }
+                    }
+                    Some(Err(e)) => {
+                        eprintln!("Deepgram read error: {}", e);
+                        break;
+                    }
+                    None => {
+                        println!("Deepgram connection closed");
+                        break;
+                    }
                 }
             }
         }
-    });
-
-    // Wait for either direction to finish, then abort the other
-    tokio::select! {
-        _ = client_to_dg => {},
-        _ = dg_to_client => {},
     }
 
+    let _ = dg_handle.close_stream().await;
+    let _ = client_sender
+        .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+            code: 1000,
+            reason: "Session ended".into(),
+        })))
+        .await;
+
     println!("WebSocket proxy session ended");
+}
+
+/// Sends a close frame to the (un-split) client WebSocket, ignoring errors.
+async fn close_client(client_ws: WebSocket, code: u16, reason: &str) {
+    let (mut sender, _) = client_ws.split();
+    let _ = sender
+        .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+            code,
+            reason: reason.into(),
+        })))
+        .await;
+}
+
+/// Maps an encoding query-parameter string to the SDK's [`Encoding`] enum,
+/// falling back to a custom encoding for any value the SDK does not model.
+fn map_encoding(value: &str) -> Encoding {
+    match value {
+        "linear16" => Encoding::Linear16,
+        "linear32" => Encoding::Linear32,
+        "flac" => Encoding::Flac,
+        "mulaw" => Encoding::Mulaw,
+        "amr-nb" => Encoding::AmrNb,
+        "amr-wb" => Encoding::AmrWb,
+        "opus" => Encoding::Opus,
+        "speex" => Encoding::Speex,
+        "g729" => Encoding::G729,
+        other => Encoding::CustomEncoding(other.to_string()),
+    }
 }
 
 // ============================================================================
